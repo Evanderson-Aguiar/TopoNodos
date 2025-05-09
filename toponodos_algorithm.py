@@ -30,7 +30,6 @@ __copyright__ = '(C) 2025 by Evanderson H. Aguiar'
 
 __revision__ = '$Format:%H$'
 
-# -*- coding: utf-8 -*-
 from qgis.PyQt.QtCore import QCoreApplication
 from qgis.core import (
     QgsProcessing,
@@ -48,8 +47,7 @@ from qgis.core import (
     QgsWkbTypes,
     QgsCoordinateTransform,
     QgsProject,
-    QgsRasterLayer,
-    QgsVectorLayer,
+    QgsCoordinateReferenceSystem,
     QgsUnitTypes
 )
 from PyQt5.QtCore import QVariant
@@ -59,23 +57,18 @@ class TopoNodosAlgorithm(QgsProcessingAlgorithm):
     def initAlgorithm(self, config=None):
         self.addParameter(QgsProcessingParameterRasterLayer('MDS', self.tr('Modelo Digital de Superfície (Raster)')))
         self.addParameter(QgsProcessingParameterFeatureSource('TUBULACOES', self.tr('Tubulações (linhas)'), types=[QgsProcessing.TypeVectorLine]))
-        self.addParameter(QgsProcessingParameterNumber('SUAVIZACAO', self.tr('Fator de suavização (m)'), type=QgsProcessingParameterNumber.Double, defaultValue=0.5, minValue=0.0))
-        self.addParameter(QgsProcessingParameterNumber('PASSO_INTERPOLACAO', self.tr('Passo de interpolação (m)'), type=QgsProcessingParameterNumber.Double, defaultValue=1.0, minValue=0.1))
+        self.addParameter(QgsProcessingParameterNumber('SUAVIZACAO', self.tr('Fator de suavização (m)'), type=QgsProcessingParameterNumber.Double, defaultValue=0.5, minValue=0.1))
+        self.addParameter(QgsProcessingParameterNumber('PASSO_INTERPOLACAO', self.tr('Passo de interpolação (m)'), type=QgsProcessingParameterNumber.Double, defaultValue=20.0, minValue=2.0))
         self.addParameter(QgsProcessingParameterFeatureSink('SAIDA_LINHAS', self.tr('Linhas quebradas nos pontos de inflexão')))
         self.addParameter(QgsProcessingParameterFeatureSink('SAIDA_PONTOS', self.tr('Pontos de inflexão (nós com elevação)')))
 
     def processAlgorithm(self, parameters, context, feedback):
+        import math
+
         mds = self.parameterAsRasterLayer(parameters, 'MDS', context)
         tubulacoes = self.parameterAsSource(parameters, 'TUBULACOES', context)
         suavizacao = self.parameterAsDouble(parameters, 'SUAVIZACAO', context)
         passo = self.parameterAsDouble(parameters, 'PASSO_INTERPOLACAO', context)
-
-        if mds.crs().mapUnits() != QgsUnitTypes.DistanceMeters:
-            feedback.reportError("O raster deve estar em um sistema de coordenadas com unidades em metros.")
-
-        transform = None
-        if tubulacoes.sourceCrs() != mds.crs():
-            transform = QgsCoordinateTransform(tubulacoes.sourceCrs(), mds.crs(), QgsProject.instance())
 
         campos_pontos = QgsFields()
         campos_pontos.append(QgsField('elev', QVariant.Double))
@@ -86,8 +79,16 @@ class TopoNodosAlgorithm(QgsProcessingAlgorithm):
         sink_pontos, saida_pontos_id = self.parameterAsSink(parameters, 'SAIDA_PONTOS', context, campos_pontos, QgsWkbTypes.Point, mds.crs())
         sink_linhas, saida_linhas_id = self.parameterAsSink(parameters, 'SAIDA_LINHAS', context, campos_linhas, QgsWkbTypes.LineString, mds.crs())
 
-
         pontos_registrados = set()
+
+        centro = mds.extent().center()
+        lat = centro.y()
+        utm_zone = int((centro.x() + 180) / 6) + 1
+        epsg = 32700 + utm_zone if lat < 0 else 32600 + utm_zone
+        crs_proj = QgsCoordinateReferenceSystem(f"EPSG:{epsg}")
+
+        transform_to_proj = QgsCoordinateTransform(tubulacoes.sourceCrs(), crs_proj, QgsProject.instance())
+        transform_to_mds = QgsCoordinateTransform(crs_proj, mds.crs(), QgsProject.instance())
 
         for i, feat in enumerate(tubulacoes.getFeatures()):
             if feedback.isCanceled():
@@ -101,43 +102,55 @@ class TopoNodosAlgorithm(QgsProcessingAlgorithm):
 
             for linha in linhas:
                 geom_linha = QgsGeometry.fromPolylineXY(linha)
-
-                if transform:
-                    geom_linha.transform(transform)
-
+                geom_linha.transform(transform_to_proj)
                 coords_linha = geom_linha.asPolyline()
 
-                inflexoes = self.extrair_inflexoes(geom_linha, mds, passo, suavizacao)
+                inflexoes = self.extrair_inflexoes(geom_linha, mds, passo, suavizacao, transform_to_mds)
 
-                # inclui início e fim com elevação
-                inflexoes = [(coords_linha[0], self.amostrar_elevacao(coords_linha[0], mds))] + \
+                inflexoes = [(coords_linha[0], self.amostrar_elevacao(coords_linha[0], mds, transform_to_mds))] + \
                             inflexoes + \
-                            [(coords_linha[-1], self.amostrar_elevacao(coords_linha[-1], mds))]
+                            [(coords_linha[-1], self.amostrar_elevacao(coords_linha[-1], mds, transform_to_mds))]
 
                 for pt, elev in inflexoes:
-                    key = (round(pt.x(), 4), round(pt.y(), 4))
+                    pt_mds = transform_to_mds.transform(pt)
+                    key = (round(pt_mds.x(), 4), round(pt_mds.y(), 4))
                     if key not in pontos_registrados:
                         f = QgsFeature()
-                        f.setGeometry(QgsGeometry.fromPointXY(pt))
+                        f.setGeometry(QgsGeometry.fromPointXY(pt_mds))
                         f.setFields(campos_pontos)
                         f.setAttribute('elev', elev)
                         f.setAttribute('id_linha', feat.id())
                         sink_pontos.addFeature(f, QgsFeatureSink.FastInsert)
                         pontos_registrados.add(key)
 
-                indices = self.encontrar_indices_inflexao(inflexoes, coords_linha)
-                indices = sorted(set(indices))
-                if indices:
-                    segmentos = []
-                    for a, b in zip(indices[:-1], indices[1:]):
-                        segmento = coords_linha[a:b+1]
-                        if len(segmento) >= 2:
+                if len(inflexoes) >= 2:
+                    # Cortar a linha original entre os pontos de inflexão
+                    distancias = [geom_linha.lineLocatePoint(QgsGeometry.fromPointXY(pt)) for pt, _ in inflexoes]
+                    distancias = sorted(set(distancias))
+                    comprimento = geom_linha.length()
+
+                    for i in range(len(distancias) - 1):
+                        d_start = distancias[i]
+                        d_end = distancias[i + 1]
+                        trecho = []
+
+                        n = int((d_end - d_start) // 0.5) + 2  # cada 0.5m
+                        for j in range(n):
+                            dist = d_start + (d_end - d_start) * j / (n - 1)
+                            if 0 <= dist <= comprimento:
+                                trecho.append(geom_linha.interpolate(dist).asPoint())
+
+                        if len(trecho) >= 2:
                             nova = QgsFeature(feat)
-                            nova.setGeometry(QgsGeometry.fromPolylineXY(segmento))
+                            seg_geom = QgsGeometry.fromPolylineXY(trecho)
+                            seg_geom.transform(transform_to_mds)
+                            nova.setGeometry(seg_geom)
                             sink_linhas.addFeature(nova, QgsFeatureSink.FastInsert)
                 else:
                     nova = QgsFeature(feat)
-                    nova.setGeometry(geom_linha)
+                    geom_original = QgsGeometry.fromPolylineXY(coords_linha)
+                    geom_original.transform(transform_to_mds)
+                    nova.setGeometry(geom_original)
                     sink_linhas.addFeature(nova, QgsFeatureSink.FastInsert)
 
             feedback.setProgress(int(100 * i / tubulacoes.featureCount()))
@@ -147,7 +160,7 @@ class TopoNodosAlgorithm(QgsProcessingAlgorithm):
             'SAIDA_PONTOS': saida_pontos_id
         }
 
-    def extrair_inflexoes(self, geom_linha, raster, passo, suavizacao):
+    def extrair_inflexoes(self, geom_linha, raster, passo, suavizacao, transform_to_mds):
         comprimento = geom_linha.length()
         n_pontos = int(comprimento // passo) + 1
         pontos = []
@@ -156,11 +169,13 @@ class TopoNodosAlgorithm(QgsProcessingAlgorithm):
         for i in range(n_pontos):
             dist = i * passo
             pt = geom_linha.interpolate(dist).asPoint()
+            pt_proj = QgsPointXY(pt)
+            pt_mds = transform_to_mds.transform(pt_proj)
 
-            if not raster.extent().contains(QgsPointXY(pt)):
+            if not raster.extent().contains(pt_mds):
                 continue
 
-            resultado = raster.dataProvider().sample(QgsPointXY(pt), 1)
+            resultado = raster.dataProvider().sample(pt_mds, 1)
             if resultado[1] is False or resultado[0] is None:
                 continue
 
@@ -184,31 +199,18 @@ class TopoNodosAlgorithm(QgsProcessingAlgorithm):
 
         return inflexoes
 
-    def amostrar_elevacao(self, pt, raster):
-        if not raster.extent().contains(pt):
+    def amostrar_elevacao(self, pt_proj, raster, transform_to_mds):
+        pt_mds = transform_to_mds.transform(pt_proj)
+        if not raster.extent().contains(pt_mds):
             return None
-        resultado = raster.dataProvider().sample(QgsPointXY(pt), 1)
+        resultado = raster.dataProvider().sample(pt_mds, 1)
         return resultado[0] if resultado[1] else None
-
-    def encontrar_indices_inflexao(self, inflexoes, pontos, tolerancia=0.01):
-        indices = []
-        for pt, _ in inflexoes:
-            idx = min(range(len(pontos)), key=lambda i: pt.distance(pontos[i]))
-            if pt.distance(pontos[idx]) <= tolerancia:
-                indices.append(idx)
-        return indices
 
     def name(self):
         return 'TopoNodos'
 
     def displayName(self):
         return self.tr(self.name())
-
-    def group(self):
-        return self.tr(self.groupId())
-
-    def groupId(self):
-        return 'analise_altimetrica'
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)
