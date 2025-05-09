@@ -51,14 +51,18 @@ from qgis.core import (
     QgsUnitTypes
 )
 from PyQt5.QtCore import QVariant
+from qgis.PyQt.QtGui import QIcon
+from .resources import *
+import os
+from qgis.core import QgsPoint
 
 class TopoNodosAlgorithm(QgsProcessingAlgorithm):
 
     def initAlgorithm(self, config=None):
         self.addParameter(QgsProcessingParameterRasterLayer('MDS', self.tr('Modelo Digital de Superfície (Raster)')))
         self.addParameter(QgsProcessingParameterFeatureSource('TUBULACOES', self.tr('Tubulações (linhas)'), types=[QgsProcessing.TypeVectorLine]))
-        self.addParameter(QgsProcessingParameterNumber('SUAVIZACAO', self.tr('Fator de suavização (m)'), type=QgsProcessingParameterNumber.Double, defaultValue=0.5, minValue=0.1))
-        self.addParameter(QgsProcessingParameterNumber('PASSO_INTERPOLACAO', self.tr('Passo de interpolação (m)'), type=QgsProcessingParameterNumber.Double, defaultValue=20.0, minValue=2.0))
+        self.addParameter(QgsProcessingParameterNumber('SUAVIZACAO', self.tr('Fator de suavização (m)'), type=QgsProcessingParameterNumber.Double, defaultValue=1.0, minValue=0.1))
+        self.addParameter(QgsProcessingParameterNumber('PASSO_INTERPOLACAO', self.tr('Passo de interpolação (m)'), type=QgsProcessingParameterNumber.Double, defaultValue=200.0, minValue=2.0))
         self.addParameter(QgsProcessingParameterFeatureSink('SAIDA_LINHAS', self.tr('Linhas quebradas nos pontos de inflexão')))
         self.addParameter(QgsProcessingParameterFeatureSink('SAIDA_PONTOS', self.tr('Pontos de inflexão (nós com elevação)')))
 
@@ -76,7 +80,9 @@ class TopoNodosAlgorithm(QgsProcessingAlgorithm):
 
         campos_linhas = tubulacoes.fields()
 
-        sink_pontos, saida_pontos_id = self.parameterAsSink(parameters, 'SAIDA_PONTOS', context, campos_pontos, QgsWkbTypes.Point, mds.crs())
+        #sink_pontos, saida_pontos_id = self.parameterAsSink(parameters, 'SAIDA_PONTOS', context, campos_pontos, QgsWkbTypes.Point, mds.crs())
+
+        sink_pontos, saida_pontos_id = self.parameterAsSink(     parameters,     'SAIDA_PONTOS',     context,     campos_pontos,     QgsWkbTypes.PointZ,     mds.crs() )
         sink_linhas, saida_linhas_id = self.parameterAsSink(parameters, 'SAIDA_LINHAS', context, campos_linhas, QgsWkbTypes.LineString, mds.crs())
 
         pontos_registrados = set()
@@ -116,10 +122,11 @@ class TopoNodosAlgorithm(QgsProcessingAlgorithm):
                     key = (round(pt_mds.x(), 4), round(pt_mds.y(), 4))
                     if key not in pontos_registrados:
                         f = QgsFeature()
-                        f.setGeometry(QgsGeometry.fromPointXY(pt_mds))
+                        pt_z = QgsGeometry.fromPoint(QgsPoint(pt_mds.x(), pt_mds.y(), elev))
+                        f.setGeometry(pt_z)
                         f.setFields(campos_pontos)
                         f.setAttribute('elev', elev)
-                        f.setAttribute('id_linha', feat.id())
+                        f.setAttribute('id_linha', feat.id())                       
                         sink_pontos.addFeature(f, QgsFeatureSink.FastInsert)
                         pontos_registrados.add(key)
 
@@ -210,10 +217,13 @@ class TopoNodosAlgorithm(QgsProcessingAlgorithm):
         return 'TopoNodos'
 
     def displayName(self):
-        return self.tr(self.name())
+        return self.tr('Análise Altimétrica')
 
     def tr(self, string):
         return QCoreApplication.translate('Processing', string)
 
     def createInstance(self):
         return TopoNodosAlgorithm()
+
+    def icon(self):
+        return QIcon(os.path.dirname(__file__) + '/icon.png')
